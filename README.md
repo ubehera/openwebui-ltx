@@ -112,12 +112,28 @@ function signature is exposed via the docstring schema:
 generate_video(prompt: str, seconds: float = 5.0, width: int = 960, height: int = 544,
                fps: int = 24, seed: int = 42, steps: int = 8, cfg: float = 1.0,
                negative_prompt: str = "", enhance_prompt: bool = True,
-               enhance_with: str | None = None)
+               enhance_with: str | None = None,
+               style_preset: str | None = None)
 ```
 
 Per-call `enhance_with` override lets the chat model (or the user) flip enhancers
 mid-conversation: `enhance_with="fast"` for quick iteration, `enhance_with="current"`
 when the dropdown model is the right tool, `enhance_with="off"` to skip.
+
+`style_preset` overrides `width` / `height` with a known-good LTX-friendly resolution.
+The chat model picks one based on the user's verbal aspect cue (the docstring lists
+the mapping). Available presets:
+
+| Preset          | Resolution | Aspect | Use case                              |
+| :-------------- | :--------- | :----- | :------------------------------------ |
+| `cinematic`     | 960x544    | 16:9   | default landscape (fast)              |
+| `landscape`     | 960x544    | 16:9   | alias for `cinematic`                 |
+| `cinematic_hd`  | 1280x720   | 16:9   | HD landscape (slower)                 |
+| `vertical`      | 544x960    | 9:16   | TikTok / Reels / Shorts               |
+| `portrait`      | 544x960    | 9:16   | alias for `vertical`                  |
+| `vertical_hd`   | 720x1280   | 9:16   | HD vertical                           |
+| `square`        | 768x768    | 1:1    | Instagram / Twitter native            |
+| `ultrawide`     | 1280x544   | ~21:9  | cinematic widescreen / anamorphic     |
 
 Example chat input:
 

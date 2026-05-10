@@ -19,6 +19,20 @@ import aiohttp
 from pydantic import BaseModel, Field
 
 
+# LTX-friendly resolution presets (all multiples of 32). Picked for the most common
+# distribution targets so the chat model can map a user's verbal cue ("vertical",
+# "TikTok", "16:9", "square") to a width/height pair without inventing one.
+STYLE_PRESETS: dict[str, tuple[int, int]] = {
+    "cinematic":    (960, 544),    # 16:9-ish, default landscape (fast)
+    "landscape":    (960, 544),    # alias
+    "cinematic_hd": (1280, 720),   # 16:9 HD (slower)
+    "vertical":     (544, 960),    # 9:16 for TikTok / Reels / Shorts
+    "portrait":     (544, 960),    # alias
+    "vertical_hd":  (720, 1280),   # 9:16 HD (slower)
+    "square":       (768, 768),    # 1:1 for Instagram / Twitter native
+    "ultrawide":    (1280, 544),   # ~21:9 cinematic widescreen
+}
+
 # Defaults assume ComfyUI on the same host as Open WebUI. Point at your own host via valves.
 COMFYUI_BASE_URL_DEFAULT = "http://127.0.0.1:8188"
 # Preferred enhancement path: route through Open WebUI's /openai/chat/completions proxy
@@ -506,6 +520,7 @@ class Tools:
         negative_prompt: str = "",
         enhance_prompt: bool = True,
         enhance_with: Optional[str] = None,
+        style_preset: Optional[str] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __model__: Optional[dict] = None,
     ) -> str:
@@ -516,10 +531,20 @@ class Tools:
           - <=8s: single-segment with synced audio (V+A workflow).
           - >8s: chained LTXVExtendSampler segments, video-only (LTX has no audio extender).
 
+        Aspect ratio: prefer style_preset over manual width/height. Map the user's
+        verbal cue to a preset rather than inventing dimensions:
+          - cinematic / landscape / 16:9 / "movie shot"     -> "cinematic" (960x544)
+          - HD landscape / "high quality" / "1080p"         -> "cinematic_hd" (1280x720)
+          - vertical / portrait / TikTok / Reels / Shorts / 9:16 -> "vertical" (544x960)
+          - HD vertical                                     -> "vertical_hd" (720x1280)
+          - square / Instagram / 1:1 / "profile-style"      -> "square" (768x768)
+          - ultrawide / widescreen / 21:9 / "anamorphic"    -> "ultrawide" (1280x544)
+        If the user gives no aspect cue, default to "cinematic".
+
         :param prompt: Text describing the desired scene. Be descriptive about subject, action, lighting, camera.
         :param seconds: Target duration in seconds (1.0 - 80.0). Past 24s the model drifts noticeably.
-        :param width: Frame width in pixels (multiple of 32, default 960).
-        :param height: Frame height in pixels (multiple of 32, default 544).
+        :param width: Frame width in pixels (multiple of 32, default 960). Ignored if style_preset is set.
+        :param height: Frame height in pixels (multiple of 32, default 544). Ignored if style_preset is set.
         :param fps: Frames per second (default 24).
         :param seed: Random seed for reproducibility (default 42).
         :param steps: Diffusion steps. Distilled checkpoint runs cleanly at 6-12 steps (default 8).
@@ -527,8 +552,13 @@ class Tools:
         :param negative_prompt: Optional negative prompt (rarely needed for distilled model).
         :param enhance_prompt: If true and an enhancer is configured, rewrite the prompt with LTX's Creative Assistant system prompt before encoding.
         :param enhance_with: Per-call override for the enhancer choice: 'current' (chat-dropdown model), 'fast' (small model from valves), 'off', or any explicit model id. Defaults to the valve setting.
+        :param style_preset: One of: cinematic, landscape, cinematic_hd, vertical, portrait, vertical_hd, square, ultrawide. When set, overrides width/height with the preset's dimensions.
         :return: Markdown with an embedded video URL once generation completes.
         """
+        if style_preset:
+            key = style_preset.strip().lower()
+            if key in STYLE_PRESETS:
+                width, height = STYLE_PRESETS[key]
         seconds = max(1.0, min(80.0, float(seconds)))
         width = max(256, (int(width) // 32) * 32)
         height = max(256, (int(height) // 32) * 32)
