@@ -80,6 +80,47 @@ Output:
 Style: realistic with cinematic lighting. In a medium close-up, a woman in her early 30s with shoulder-length brown hair sits at a small wooden table by the window. She wears a cream-colored turtleneck sweater, holding a white ceramic coffee cup in one hand and a smartphone to her ear with the other. Ambient cafe sounds fill the space—espresso machine hiss, quiet conversations, gentle clinking of cups. The woman listens intently, nodding slightly, then takes a sip of her coffee and sets it down with a soft clink. Her face brightens into a warm smile as she speaks in a clear, friendly voice, 'That sounds perfect! I'd love to meet up this weekend. How about Saturday afternoon?' She laughs softly—a genuine chuckle—and shifts in her chair. Behind her, other patrons move subtly in and out of focus. 'Great, I'll see you then,' she concludes cheerfully, lowering the phone."""
 
 
+# Video-only variant for long-mode (>8s) clips. LTX has no audio extender past 8s,
+# so describing soundscapes/dialogue in the prompt wastes tokens (the audio guidance
+# block) and risks the model devoting attention budget to acoustics that won't render.
+LTX_T2V_VIDEO_ONLY_SYSTEM_PROMPT = """\
+You are a Creative Assistant. Given a user's raw input prompt describing a scene or concept, expand it into a detailed video generation prompt with specific visuals to guide a text-to-video model. The output is a SILENT video — do NOT describe sounds, soundscapes, dialogue, or any auditory element.
+
+#### Guidelines
+- Strictly follow all aspects of the user's raw input: include every element requested (style, visuals, motions, actions, camera movement).
+    - If the input is vague, invent concrete details: lighting, textures, materials, scene settings, etc.
+        - For characters: describe gender, clothing, hair, expressions. DO NOT invent unrequested characters.
+- Use active language: present-progressive verbs ("is walking," "smiling"). If no action specified, describe natural movements.
+- Maintain chronological flow: use temporal connectors ("as," "then," "while").
+- Style: Include visual style at the beginning: "Style: <style>, <rest of prompt>." Default to cinematic-realistic if unspecified. Omit if unclear.
+- Visual only: NO non-visual senses (smell, taste, touch, sound). NO dialogue, NO described speech, NO ambient audio, NO music cues, NO sound effects.
+- Restrained language: Avoid dramatic/exaggerated terms. Use mild, natural phrasing.
+    - Colors: Use plain terms ("red dress"), not intensified ("vibrant blue," "bright red").
+    - Lighting: Use neutral descriptions ("soft overhead light"), not harsh ("blinding light").
+    - Facial features: Use delicate modifiers for subtle features (i.e., "subtle freckles").
+
+#### Important notes:
+- Analyze the user's raw input carefully. In cases of FPV or POV, exclude the description of the subject whose POV is requested.
+- Camera motion: DO NOT invent camera motion unless requested by the user.
+- No timestamps or cuts: DO NOT use timestamps or describe scene cuts unless explicitly requested.
+- Format: DO NOT use phrases like "The scene opens with...". Start directly with Style (optional) and chronological scene description.
+- Format: DO NOT start your response with special characters.
+- If a character speaks in the user's input, describe the speaking action visually (mouthing words, gesturing) but DO NOT include any quoted dialogue or describe what is said.
+- If the user's raw input prompt is highly detailed, chronological and in the requested format: DO NOT make major edits or introduce new elements.
+
+#### Output Format (Strict):
+- Single continuous paragraph in natural language (English).
+- NO titles, headings, prefaces, code fences, or Markdown.
+- If unsafe/invalid, return original user prompt. Never ask questions or clarifications.
+
+Your output quality is CRITICAL. Generate visually rich, dynamic prompts focused entirely on visual composition, motion, lighting, and action for high-quality silent video generation.
+
+#### Example
+Input: "A woman at a coffee shop talking on the phone"
+Output:
+Style: realistic with cinematic lighting. In a medium close-up, a woman in her early 30s with shoulder-length brown hair sits at a small wooden table by the window. She wears a cream-colored turtleneck sweater, holding a white ceramic coffee cup in one hand and a smartphone to her ear with the other. The woman listens intently, nodding slightly, then takes a sip of her coffee and sets the cup down. Her face brightens into a warm smile as she begins mouthing words into the phone, gesturing gently with her free hand. She tilts her head and her shoulders relax, then she shifts in her chair. Behind her, other patrons move subtly in and out of focus, and a soft beam of afternoon light passes across the wooden table. After a moment she lowers the phone with a satisfied expression."""
+
+
 def _build_workflow(
     prompt: str,
     width: int,
@@ -392,20 +433,29 @@ class Tools:
             return self.valves.fast_enhancer_model or None
         return ew  # explicit model id
 
-    async def _enhance_prompt(self, raw_prompt: str, current_model_id: Optional[str] = None) -> str:
+    async def _enhance_prompt(
+        self,
+        raw_prompt: str,
+        current_model_id: Optional[str] = None,
+        video_only: bool = False,
+    ) -> str:
         """Run the user prompt through the LTX Creative Assistant system prompt.
         Routes through Open WebUI's /openai/chat/completions proxy when an
         openwebui_token is configured (so it inherits OWUI's per-model connection
         routing). Falls back to a direct enhancer endpoint otherwise. Returns the
-        enhanced text, or the original prompt on any failure / when disabled."""
+        enhanced text, or the original prompt on any failure / when disabled.
+
+        If video_only=True, uses a system prompt that excludes audio guidance —
+        appropriate for the long-mode chained workflow which doesn't render audio."""
         target_model = self._resolve_enhancer_model(current_model_id)
         if not target_model:
             return raw_prompt
 
+        system_prompt = LTX_T2V_VIDEO_ONLY_SYSTEM_PROMPT if video_only else LTX_T2V_SYSTEM_PROMPT
         body = {
             "model": target_model,
             "messages": [
-                {"role": "system", "content": LTX_T2V_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": raw_prompt},
             ],
             "temperature": 0.5,
@@ -512,10 +562,15 @@ class Tools:
             current_model_id = (__model__ or {}).get("id") if isinstance(__model__, dict) else None
             target_model = self._resolve_enhancer_model(current_model_id) if enhance_prompt else None
             if enhance_prompt and target_model:
-                await emit(f"Enhancing prompt with {target_model}...")
+                mode_label = "video-only" if long_mode else "AV"
+                await emit(f"Enhancing prompt ({mode_label}) with {target_model}...")
                 t0 = time.time()
                 try:
-                    enhanced_prompt = await self._enhance_prompt(raw_prompt, current_model_id=current_model_id)
+                    enhanced_prompt = await self._enhance_prompt(
+                        raw_prompt,
+                        current_model_id=current_model_id,
+                        video_only=long_mode,
+                    )
                     if enhanced_prompt and enhanced_prompt != raw_prompt:
                         prompt = enhanced_prompt
                         await emit(f"Enhanced in {int(time.time()-t0)}s, submitting LTX-2.3...")
