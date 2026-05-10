@@ -3,8 +3,8 @@ title: LTX-2.3 Video Generation
 author: ubehera
 author_url: https://github.com/ubehera/openwebui-ltx
 license: Apache-2.0
-version: 0.3.0
-description: Local LTX-2.3 video gen via ComfyUI. <=8s clips include synced audio. >8s clips chain LTXVExtendSampler segments (video-only — LTX's audio path doesn't extend). Up to 80s with quality warnings past 24s. Optional prompt enhancement via any OpenAI-compatible chat endpoint using LTX's official Creative Assistant system prompt.
+version: 0.4.0
+description: Local LTX-2.3 video gen via ComfyUI. <=8s = synced audio; >8s up to 80s = chained LTXVExtendSampler (video-only). Prompt enhancement routes through Open WebUI's chat-completions proxy by default so it inherits the model selected in the chat dropdown; valve-overridable to a fast small model, off, or any explicit model id. Falls back to a direct OpenAI-compatible endpoint when the proxy isn't configured.
 required_open_webui_version: 0.5.0
 """
 
@@ -21,9 +21,16 @@ from pydantic import BaseModel, Field
 
 # Defaults assume ComfyUI on the same host as Open WebUI. Point at your own host via valves.
 COMFYUI_BASE_URL_DEFAULT = "http://127.0.0.1:8188"
-# Prompt enhancement uses any OpenAI-compatible /chat/completions endpoint.
-# Leave empty to disable enhancement entirely (or toggle per-call via enhance_prompt=False).
-# Tested with vLLM, NIM, llama.cpp server, Ollama (--openai-compat).
+# Preferred enhancement path: route through Open WebUI's /openai/chat/completions proxy
+# so we inherit whatever connection routing OWUI is already configured for. Set
+# openwebui_base_url + openwebui_token via valves to enable. When set, enhance_with="current"
+# uses the model the user has selected in the chat dropdown.
+OPENWEBUI_BASE_URL_DEFAULT = ""
+OPENWEBUI_TOKEN_DEFAULT = ""
+# Model id used when enhance_with="fast" — typically a small low-latency chat model.
+FAST_ENHANCER_MODEL_DEFAULT = ""
+# Legacy direct-endpoint valves — used as fallback if openwebui_token is empty.
+# Any OpenAI-compatible /chat/completions endpoint works (vLLM, NIM, llama.cpp, Ollama --openai-compat).
 ENHANCER_BASE_URL_DEFAULT = ""
 ENHANCER_MODEL_DEFAULT = ""
 ENHANCER_API_KEY_DEFAULT = ""
@@ -337,17 +344,34 @@ class Tools:
             default=900,
             description="Max seconds to wait for video generation before timing out.",
         )
+        enhance_with: str = Field(
+            default="current",
+            description="Which model to use for enhancement: 'current' (chat dropdown — requires openwebui_token), 'fast' (fast_enhancer_model below), 'off', or any explicit model id.",
+        )
+        fast_enhancer_model: str = Field(
+            default=FAST_ENHANCER_MODEL_DEFAULT,
+            description="Model id used when enhance_with='fast'. Should be a small, low-latency chat model.",
+        )
+        openwebui_base_url: str = Field(
+            default=OPENWEBUI_BASE_URL_DEFAULT,
+            description="Open WebUI base URL — used to route enhancement through OWUI's /openai/chat/completions proxy. Leave empty to use the legacy direct enhancer_base_url instead.",
+        )
+        openwebui_token: str = Field(
+            default=OPENWEBUI_TOKEN_DEFAULT,
+            description="Open WebUI Bearer token (admin or service JWT) for the proxy call. Required for enhance_with='current'.",
+        )
+        # Legacy direct-endpoint valves — used as fallback when openwebui_token is empty.
         enhancer_base_url: str = Field(
             default=ENHANCER_BASE_URL_DEFAULT,
-            description="OpenAI-compatible chat endpoint (e.g. http://host:8001/v1) for prompt enhancement. Empty = enhancement disabled.",
+            description="(Fallback) OpenAI-compatible chat endpoint (e.g. http://host:8001/v1) used only when openwebui_token is empty.",
         )
         enhancer_model: str = Field(
             default=ENHANCER_MODEL_DEFAULT,
-            description="Model id for prompt enhancement (must be served by enhancer_base_url).",
+            description="(Fallback) Model id for the direct enhancer endpoint.",
         )
         enhancer_api_key: str = Field(
             default=ENHANCER_API_KEY_DEFAULT,
-            description="API key for the enhancer endpoint (leave empty for no-auth servers).",
+            description="(Fallback) API key for the direct enhancer endpoint (leave empty for no-auth servers).",
         )
         enhancer_max_tokens: int = Field(
             default=512,
@@ -357,18 +381,29 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    async def _enhance_prompt(self, raw_prompt: str) -> str:
-        """Run the user prompt through the LTX Creative Assistant system prompt
-        via any OpenAI-compatible chat endpoint. Returns the enhanced text, or the
-        original prompt on any failure or when no endpoint is configured."""
-        if not self.valves.enhancer_base_url or not self.valves.enhancer_model:
+    def _resolve_enhancer_model(self, current_model_id: Optional[str]) -> Optional[str]:
+        """Map the enhance_with valve to a concrete model id, or None to skip."""
+        ew = (self.valves.enhance_with or "").strip()
+        if not ew or ew.lower() == "off":
+            return None
+        if ew.lower() == "current":
+            return current_model_id or self.valves.fast_enhancer_model or None
+        if ew.lower() == "fast":
+            return self.valves.fast_enhancer_model or None
+        return ew  # explicit model id
+
+    async def _enhance_prompt(self, raw_prompt: str, current_model_id: Optional[str] = None) -> str:
+        """Run the user prompt through the LTX Creative Assistant system prompt.
+        Routes through Open WebUI's /openai/chat/completions proxy when an
+        openwebui_token is configured (so it inherits OWUI's per-model connection
+        routing). Falls back to a direct enhancer endpoint otherwise. Returns the
+        enhanced text, or the original prompt on any failure / when disabled."""
+        target_model = self._resolve_enhancer_model(current_model_id)
+        if not target_model:
             return raw_prompt
-        url = self.valves.enhancer_base_url.rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self.valves.enhancer_api_key:
-            headers["Authorization"] = f"Bearer {self.valves.enhancer_api_key}"
+
         body = {
-            "model": self.valves.enhancer_model,
+            "model": target_model,
             "messages": [
                 {"role": "system", "content": LTX_T2V_SYSTEM_PROMPT},
                 {"role": "user", "content": raw_prompt},
@@ -376,7 +411,23 @@ class Tools:
             "temperature": 0.5,
             "max_tokens": self.valves.enhancer_max_tokens,
         }
-        timeout = aiohttp.ClientTimeout(total=120)
+
+        if self.valves.openwebui_token and self.valves.openwebui_base_url:
+            url = self.valves.openwebui_base_url.rstrip("/") + "/openai/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.valves.openwebui_token}",
+            }
+        elif self.valves.enhancer_base_url:
+            url = self.valves.enhancer_base_url.rstrip("/") + "/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if self.valves.enhancer_api_key:
+                headers["Authorization"] = f"Bearer {self.valves.enhancer_api_key}"
+            body["model"] = self.valves.enhancer_model or target_model
+        else:
+            return raw_prompt
+
+        timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(url, json=body, headers=headers) as r:
                 if r.status != 200:
@@ -385,7 +436,6 @@ class Tools:
                 data = await r.json()
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
         content = content.strip()
-        # Strip leading/trailing fences or quotes the model might add despite the system prompt.
         if content.startswith("```"):
             content = content.split("\n", 1)[-1]
             if content.endswith("```"):
@@ -405,7 +455,9 @@ class Tools:
         cfg: float = 1.0,
         negative_prompt: str = "",
         enhance_prompt: bool = True,
+        enhance_with: Optional[str] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        __model__: Optional[dict] = None,
     ) -> str:
         """
         Generate a short video clip from a text prompt using LTX-2.3.
@@ -423,7 +475,8 @@ class Tools:
         :param steps: Diffusion steps. Distilled checkpoint runs cleanly at 6-12 steps (default 8).
         :param cfg: Classifier-free guidance scale. Distilled needs cfg=1.0; raise only with non-distilled ckpt.
         :param negative_prompt: Optional negative prompt (rarely needed for distilled model).
-        :param enhance_prompt: If true and an enhancer endpoint is configured (see valves), run the prompt through it with LTX's official Creative Assistant system prompt for richer detail (~4-30s extra depending on model).
+        :param enhance_prompt: If true and an enhancer is configured, rewrite the prompt with LTX's Creative Assistant system prompt before encoding.
+        :param enhance_with: Per-call override for the enhancer choice: 'current' (chat-dropdown model), 'fast' (small model from valves), 'off', or any explicit model id. Defaults to the valve setting.
         :return: Markdown with an embedded video URL once generation completes.
         """
         seconds = max(1.0, min(80.0, float(seconds)))
@@ -452,19 +505,27 @@ class Tools:
 
         raw_prompt = prompt
         enhanced_prompt = None
-        if enhance_prompt and self.valves.enhancer_base_url and self.valves.enhancer_model:
-            await emit(f"Enhancing prompt with {self.valves.enhancer_model}...")
-            t0 = time.time()
-            try:
-                enhanced_prompt = await self._enhance_prompt(raw_prompt)
-                if enhanced_prompt and enhanced_prompt != raw_prompt:
-                    prompt = enhanced_prompt
-                    await emit(f"Enhanced in {int(time.time()-t0)}s, submitting LTX-2.3...")
-                else:
+        original_enhance_with = self.valves.enhance_with
+        if enhance_with is not None:
+            self.valves.enhance_with = enhance_with
+        try:
+            current_model_id = (__model__ or {}).get("id") if isinstance(__model__, dict) else None
+            target_model = self._resolve_enhancer_model(current_model_id) if enhance_prompt else None
+            if enhance_prompt and target_model:
+                await emit(f"Enhancing prompt with {target_model}...")
+                t0 = time.time()
+                try:
+                    enhanced_prompt = await self._enhance_prompt(raw_prompt, current_model_id=current_model_id)
+                    if enhanced_prompt and enhanced_prompt != raw_prompt:
+                        prompt = enhanced_prompt
+                        await emit(f"Enhanced in {int(time.time()-t0)}s, submitting LTX-2.3...")
+                    else:
+                        enhanced_prompt = None
+                except Exception as e:
+                    await emit(f"Enhancer failed ({e}); using raw prompt.")
                     enhanced_prompt = None
-            except Exception as e:
-                await emit(f"Enhancer failed ({e}); using raw prompt.")
-                enhanced_prompt = None
+        finally:
+            self.valves.enhance_with = original_enhance_with
 
         if long_mode:
             wf, actual_frames, n_extends = _build_extend_workflow(

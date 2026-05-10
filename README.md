@@ -68,12 +68,40 @@ After install, configure valves under **Workspace -> Tools -> LTX-2.3 Video Gene
 | `comfyui_base_url`   | `http://127.0.0.1:8188` | ComfyUI HTTP host                                              |
 | `ckpt_name`          | `ltx-2.3-22b-distilled-fp8.safetensors` | filename in `models/checkpoints/`             |
 | `text_encoder`       | `gemma_3_12B_it_fp4_mixed.safetensors`  | filename in `models/text_encoders/`           |
-| `enhancer_base_url`  | _(empty)_              | OpenAI-compat chat endpoint, e.g. `http://127.0.0.1:8080/v1`. Empty disables enhancement. |
-| `enhancer_model`     | _(empty)_              | model id served by enhancer_base_url                            |
-| `enhancer_api_key`   | _(empty)_              | bearer token for enhancer endpoint                              |
 | `max_wait_seconds`   | `900`                  | gen-time hard timeout                                           |
+| `enhance_with`       | `current`              | `current` = chat-dropdown model, `fast` = small model, `off`, or any explicit model id |
+| `fast_enhancer_model`| _(empty)_              | model id used when `enhance_with=fast`                          |
+| `openwebui_base_url` | _(empty)_              | OWUI host (e.g. `http://127.0.0.1:8080`); enables routing through OWUI's `/openai/chat/completions` proxy so the enhancer inherits whatever connection the dropdown model uses |
+| `openwebui_token`    | _(empty)_              | OWUI Bearer token for the proxy call. Required for `enhance_with=current`. |
+| `enhancer_base_url`  | _(empty)_              | _Fallback._ Direct OpenAI-compat chat endpoint, used when `openwebui_token` is empty. |
+| `enhancer_model`     | _(empty)_              | _Fallback._ Model id for the direct enhancer endpoint           |
+| `enhancer_api_key`   | _(empty)_              | _Fallback._ Bearer token for the direct endpoint                |
 
 Then enable the tool in any chat (input bar -> integrations menu -> Tools -> LTX-2.3 Video Generation toggle).
+
+### Configuration recipes
+
+**Use the model selected in the chat dropdown** (recommended; respects user choice, single source of routing truth):
+
+1. Set `openwebui_base_url` to where Open WebUI runs (e.g. `http://127.0.0.1:8080`).
+2. Set `openwebui_token` to an admin/service JWT.
+3. Leave `enhance_with` at default `"current"`.
+
+The chat model the user picks for the conversation is also what rewrites the prompt. Quality scales with the model — but so does latency (a 120B reasoning model adds 20-40s per call vs ~5s for a 30B).
+
+**Use a fixed fast model** (recommended when video gen is the only thing you care about and the chat model is heavyweight):
+
+1. Configure `openwebui_base_url` + `openwebui_token` as above.
+2. Set `fast_enhancer_model` to a small model id known to OWUI (e.g. a 7B or 30B chat model).
+3. Set `enhance_with` to `"fast"`.
+
+**Disable enhancement entirely**:
+
+Set `enhance_with` to `"off"`. Or pass `enhance_prompt=False` in the tool call.
+
+**Direct endpoint (no Open WebUI proxy)**:
+
+If you'd rather not pass an OWUI token to the tool, leave `openwebui_token` empty and use the legacy `enhancer_base_url` / `enhancer_model` / `enhancer_api_key` valves to point at any OpenAI-compatible chat endpoint (vLLM, NIM, llama.cpp, Ollama with `--openai-compat`).
 
 ## Usage
 
@@ -83,8 +111,13 @@ function signature is exposed via the docstring schema:
 ```
 generate_video(prompt: str, seconds: float = 5.0, width: int = 960, height: int = 544,
                fps: int = 24, seed: int = 42, steps: int = 8, cfg: float = 1.0,
-               negative_prompt: str = "", enhance_prompt: bool = True)
+               negative_prompt: str = "", enhance_prompt: bool = True,
+               enhance_with: str | None = None)
 ```
+
+Per-call `enhance_with` override lets the chat model (or the user) flip enhancers
+mid-conversation: `enhance_with="fast"` for quick iteration, `enhance_with="current"`
+when the dropdown model is the right tool, `enhance_with="off"` to skip.
 
 Example chat input:
 
