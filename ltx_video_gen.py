@@ -429,8 +429,8 @@ class Tools:
             description="(Fallback) API key for the direct enhancer endpoint (leave empty for no-auth servers).",
         )
         enhancer_max_tokens: int = Field(
-            default=512,
-            description="Max tokens for the enhanced prompt output.",
+            default=1024,
+            description="Max tokens for the enhanced prompt output. Reasoning models need headroom for <think> + answer; 512 is too tight for some.",
         )
 
     def __init__(self):
@@ -474,6 +474,12 @@ class Tools:
             ],
             "temperature": 0.5,
             "max_tokens": self.valves.enhancer_max_tokens,
+            # Disable reasoning/thinking for models that respect this hint
+            # (vLLM with --reasoning-parser, NVIDIA NIM Nemotron-style models).
+            # Silently ignored by models that don't support it. Without this,
+            # reasoning models can burn the entire max_tokens budget in <think>
+            # and return content=null, leaving us with no enhanced text.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         if self.valves.openwebui_token and self.valves.openwebui_base_url:
@@ -498,7 +504,13 @@ class Tools:
                     text = await r.text()
                     raise RuntimeError(f"enhancer {r.status}: {text[:200]}")
                 data = await r.json()
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        # Reasoning models can return content=null (explicit JSON null) when their
+        # full max_tokens budget gets eaten by the <think> phase. .get('content', '')
+        # only fills in for missing keys, not explicit nulls — use 'or' to coalesce.
+        msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            content = ""
         content = content.strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[-1]
